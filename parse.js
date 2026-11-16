@@ -22,7 +22,9 @@ function isAsciiPunct(ch) {
 }
 
 // Escape text content: & < > " ' are all encoded.
+const ESCAPE_RE = /[&<>"']/;
 function escapeText(s) {
+  if (!ESCAPE_RE.test(s)) return s;
   let out = '';
   let start = 0;
   for (let i = 0; i < s.length; i++) {
