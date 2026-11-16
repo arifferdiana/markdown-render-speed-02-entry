@@ -362,10 +362,12 @@ function inlineItems(src, refs) {
       continue;
     }
     // extended autolinks: www., http://, https://, ftp://, bare email.
-    // Schemes are case-insensitive (Https:// is an autolink too).
-    if (c === 119 || c === 87 || c === 104 || c === 72 || c === 102 || c === 70) {
+    // 'www.' must be lowercase (Www. is plain text); schemes are
+    // case-insensitive (Https:// is an autolink).
+    // (suppressed inside a link's label text)
+    if (!NO_AUTOLINK && (c === 119 || c === 87 || c === 104 || c === 72 || c === 102 || c === 70)) {
       const head = src.slice(i, i + 8).toLowerCase();
-      if (head.startsWith('www.') || head.startsWith('http://') || head.startsWith('https://') || head.startsWith('ftp://')) {
+      if (src.startsWith('www.', i) || head.startsWith('http://') || head.startsWith('https://') || head.startsWith('ftp://')) {
         const ext = matchExtendedUrl(src, i);
         if (ext !== null) {
           flushText(i);
@@ -381,7 +383,8 @@ function inlineItems(src, refs) {
     }
     // scheme autolink: lowercase mailto:/xmpp: + email (+ one path seg
     // for xmpp) is a single link covering the whole span
-    if (c === 109 || c === 120) {
+    // (suppressed inside a link's label text)
+    if (!NO_AUTOLINK && (c === 109 || c === 120)) {
       const sch = matchSchemeEmail(src, i);
       if (sch !== null) {
         flushText(i);
@@ -392,8 +395,8 @@ function inlineItems(src, refs) {
       }
     }
     // bare email (only when preceded by start or a non-word char, and the
-    // local part starts here)
-    if (isEmailStart(src, i)) {
+    // local part starts here). Suppressed inside a link's label text.
+    if (!NO_AUTOLINK && isEmailStart(src, i)) {
       const em = matchEmail(src, i);
       if (em !== null) {
         flushText(i);
@@ -599,16 +602,15 @@ function matchExtendedUrl(src, i) {
   }
   if (end <= i) return null;
   const url = src.slice(i, end);
-  // a www. link needs a dot in the domain part (case-insensitive)
-  const lowerUrl = url.toLowerCase();
-  if (lowerUrl.startsWith('www.')) {
+  // a www. link needs a dot in the domain part; the www. must be lowercase
+  if (url.startsWith('www.')) {
     const after = url.slice(4);
     if (!after.includes('.')) return null;
     if (after.includes(' ') || after.includes('<')) return null;
   }
   // must contain a dot after the scheme for scheme links too (host check is
   // loose: require at least one '.' in the authority)
-  const href = lowerUrl.startsWith('www.') ? 'http://' + url : url;
+  const href = url.startsWith('www.') ? 'http://' + url : url;
   return { t: 'auto', href, text: url, len: end - i };
 }
 
@@ -765,7 +767,10 @@ function tryParseLink(src, open, refs, isImg) {
         if (isImg) {
           return { item: { t: 'img', href: parsed.dest, title, alt: plainText(labelRaw, refs) }, end: k + 1 };
         }
+        const prevNoAuto = NO_AUTOLINK;
+        NO_AUTOLINK = true;
         const kids = inlineItems(labelRaw, refs);
+        NO_AUTOLINK = prevNoAuto;
         // a link may not contain a link in its text
         if (containsLink(kids)) return null;
         return { item: { t: 'link', href: parsed.dest, title, kids }, end: k + 1 };
@@ -793,7 +798,10 @@ function tryParseLink(src, open, refs, isImg) {
   if (isImg) {
     return { item: { t: 'img', href: ref.href, title: ref.title, alt: plainText(labelRaw, refs) }, end };
   }
+  const prevNoAuto = NO_AUTOLINK;
+  NO_AUTOLINK = true;
   const kids = inlineItems(labelRaw, refs);
+  NO_AUTOLINK = prevNoAuto;
   // a link may not contain a link in its text
   if (containsLink(kids)) return null;
   return { item: { t: 'link', href: ref.href, title: ref.title, kids }, end };
@@ -992,6 +1000,10 @@ let COLLECT_ONLY = false;
 // item ANY ordered marker interrupts a paragraph (a nested list), while at
 // the top level only a marker numbered 1 (or a bullet) does.
 let IN_LIST_ITEM = false;
+
+// True while parsing a link's label text: autolinks inside a label are
+// plain text, not links (a link's text may not contain a link).
+let NO_AUTOLINK = false;
 
 function isBlankLine(s) {
   for (let i = 0; i < s.length; i++) {
@@ -1304,8 +1316,10 @@ function tryTable(lines, i, end, refs) {
   let j = i + 2;
   // body rows need no pipe: a bare line is a one-cell row (padded with
   // empty cells). Rows run until a blank line or a line that starts
-  // another block (e.g. a blockquote, gfm-201).
-  while (j < end && !isBlankLine(lines[j]) && !interruptsParagraph(lines, j, end)) {
+  // another block (e.g. a blockquote, gfm-201). A whitespace-only line
+  // that contains a TAB is an empty row, not a blank line (a spaces-only
+  // line does end the table).
+  while (j < end && (!isBlankLine(lines[j]) || lines[j].includes('\t')) && !interruptsParagraph(lines, j, end)) {
     const cells = splitTableRow(lines[j]);
     let row = '<tr>\n';
     for (let c = 0; c < headerCells.length; c++) {
