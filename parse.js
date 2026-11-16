@@ -1244,9 +1244,6 @@ function matchListMarker(line) {
   else if (startsWithTab) contentCol = cols + markerLen + 1;
   else if (wsCols >= 1 && wsCols <= 4) contentCol = cols + markerLen + wsCols;
   else contentCol = cols + markerLen + 1;
-  if (empty) contentCol = cols + markerLen + 1;
-  else if (wsCols >= 1 && wsCols <= 4) contentCol = cols + markerLen + wsCols;
-  else contentCol = cols + markerLen + 1;
   return { kind, marker: line.slice(idx, idx + markerLen), num, digits, delim, indent: cols, contentCol, empty };
 }
 
