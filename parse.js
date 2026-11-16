@@ -349,7 +349,21 @@ function inlineItems(src, refs) {
         // track <a> / </a>: an unclosed <a> suppresses later autolinks
         const tl = tag.toLowerCase();
         if (tl.startsWith('</a') && (tl.length === 3 || tl[3] === '>' || tl[3] === ' ' || tl[3] === '\t' || tl[3] === '\n')) INSIDE_A_TAG = false;
-        else if (tl.startsWith('<a') && (tl.length === 2 || tl[2] === '>' || tl[2] === ' ' || tl[2] === '\t' || tl[2] === '\n') && !tl.endsWith('/>')) INSIDE_A_TAG = true;
+        else if (tl.startsWith('<a') && (tl.length === 2 || tl[2] === '>' || tl[2] === ' ' || tl[2] === '\t' || tl[2] === '\n')) {
+          // A self-closing '<a ... />' followed by other content in the
+          // same paragraph opens an anchor that persists (marked
+          // suppresses autolinks in later paragraphs); alone in its
+          // paragraph it does not ('<a  />' alone leaves the next
+          // paragraph's autolink intact, but '<a  /><b2>' suppresses
+          // it). So a '/>' tag sets the flag only when non-whitespace
+          // content follows it in this inline run.
+          if (!tl.endsWith('/>')) INSIDE_A_TAG = true;
+          else {
+            let k = i + tag.length;
+            while (k < n && (src[k] === ' ' || src[k] === '\t' || src[k] === '\n')) k++;
+            if (k < n) INSIDE_A_TAG = true;
+          }
+        }
         i += tag.length;
         textStart = i;
         continue;
@@ -992,19 +1006,42 @@ function tryParseLink(src, open, refs, isImg) {
   }
   const labelRaw = src.slice(open + 1, close);
   if (labelRaw.length > 999) return null;
-  // Count backticks in the label. An odd total means the label holds a
-  // code span whose opening and closing runs differ in length ('a
-  // ``b`'), which marked treats as leaving an unpaired backtick that
-  // suppresses emphasis later in the paragraph until the next code
-  // span ('[a ``b`](u) _x y_ ``c``' leaves '_x y_' literal, while
-  // '[a `b`](u)' or '[a ``b``](u)' with matched runs does not).
-  // Escaped backticks ('\\`') are literal text, not code-span
-  // delimiters, and do not count (doc-07's '[... \\` path]' label).
-  let labelTicks = 0;
-  for (let q = 0; q < labelRaw.length; q++) {
-    if (labelRaw.charCodeAt(q) === 96 && (q === 0 || labelRaw.charCodeAt(q - 1) !== 92)) labelTicks++;
+  // A label holds an unpaired backtick run when its backtick runs do
+  // not pair up as code spans (a run pairs with the next run of the
+  // same length). Such a label ('a ``b`', runs 2 then 1) leaves an
+  // unpaired backtick that suppresses emphasis later in the paragraph
+  // until the last code span ('[a ``b`](u) _x y_ ``c``' leaves '_x y_'
+  // literal). A label whose runs all pair ('a ``b``', '[a `b`]', or a
+  // valid span containing a backtick such as '``a ` b``' with runs 2,
+  // 1, 2) does NOT suppress, even when the total backtick count is
+  // odd. Escaped backticks ('\\`') are literal text and do not count
+  // (doc-07's '[... \\` path]' label).
+  let labelOddTicks = false;
+  {
+    const runs = [];
+    for (let q = 0; q < labelRaw.length; q++) {
+      if (labelRaw.charCodeAt(q) === 96 && (q === 0 || labelRaw.charCodeAt(q - 1) !== 92)) {
+        let r = q;
+        while (r < labelRaw.length && labelRaw.charCodeAt(r) === 96) r++;
+        runs.push(r - q);
+        q = r - 1;
+      }
+    }
+    // Greedy left-to-right pairing: a run pairs with the next unpaired
+    // run of the same length, and pairing consumes every run between
+    // them (the span's content, e.g. the inner 1-run in '``a ` b``').
+    // Any run left unpaired marks the label.
+    const paired = new Array(runs.length).fill(false);
+    for (let a = 0; a < runs.length; a++) {
+      if (paired[a]) continue;
+      let found = -1;
+      for (let b = a + 1; b < runs.length; b++) {
+        if (!paired[b] && runs[b] === runs[a]) { found = b; break; }
+      }
+      if (found >= 0) { for (let k = a; k <= found; k++) paired[k] = true; }
+      else { labelOddTicks = true; break; }
+    }
   }
-  const labelOddTicks = (labelTicks % 2) === 1;
   let j = close + 1;
   // inline link: (dest "title")
   if (src[j] === '(') {
@@ -1191,16 +1228,22 @@ function resolveEmphasis(items) {
       // blocking strong: when this pair would be an em (not a strong)
       // with '*' delimiters, a blocking strong node (opener could not
       // close, closer could open) that is the nearest em/strong node
-      // before the closer, with no delimiter between it and the closer,
-      // forbids pairing across it. '_' outer delimiters are not blocked
-      // (doc-05/20/31 form their outer em across such a strong). A later
-      // closer (past another em/strong node) may still pair.
+      // before the closer, with no OPENER delimiter between it and the
+      // closer, forbids pairing across it. '_' outer delimiters are not
+      // blocked (doc-05/20/31 form their outer em across such a strong).
+      // A later closer (past another em/strong node) may still pair. A
+      // closer-only delimiter (e.g. the '*' after 'parse' in '**a
+      // *input **parse**parse* b**', itself blocked from pairing) does
+      // not hide the strong: it is skipped, not a break.
       if (op.ch === '*' && closer.ch === '*' && !(op.n >= 2 && closer.n >= 2)) {
         let blocked = false;
         for (let s = ci - 1; s > oj; s--) {
           const it = items[s];
           if (!it) continue;
-          if (it.t === 'delim') break;
+          if (it.t === 'delim') {
+            if (it.open) break;
+            continue;
+          }
           if (it.t === 'strong' || it.t === 'em' || it.t === 'del') {
             blocked = it.t === 'strong' && !!it.blk;
             break;
