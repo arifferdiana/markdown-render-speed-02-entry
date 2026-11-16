@@ -329,11 +329,17 @@ function inlineItems(src, refs) {
       if (tag !== null) {
         flushText(i);
         items.push({ t: 'html', s: tag });
+        // track <a> / </a>: an unclosed <a> suppresses later autolinks
+        const tl = tag.toLowerCase();
+        if (tl.startsWith('</a') && (tl.length === 3 || tl[3] === '>' || tl[3] === ' ' || tl[3] === '\t' || tl[3] === '\n')) INSIDE_A_TAG = false;
+        else if (tl.startsWith('<a') && (tl.length === 2 || tl[2] === '>' || tl[2] === ' ' || tl[2] === '\t' || tl[2] === '\n') && !tl.endsWith('/>')) INSIDE_A_TAG = true;
         i += tag.length;
         textStart = i;
         continue;
       }
-      // autolink <scheme:...> or <email>
+      // autolink <scheme:...> or <email>. NOTE: unlike bare autolinks,
+      // the <...> form is NOT suppressed inside a link label or an <a>
+      // tag (marked nests it).
       const auto = matchAutolink(src, i);
       if (auto !== null) {
         flushText(i);
@@ -364,8 +370,8 @@ function inlineItems(src, refs) {
     // extended autolinks: www., http://, https://, ftp://, bare email.
     // 'www.' must be lowercase (Www. is plain text); schemes are
     // case-insensitive (Https:// is an autolink).
-    // (suppressed inside a link's label text)
-    if (!NO_AUTOLINK && (c === 119 || c === 87 || c === 104 || c === 72 || c === 102 || c === 70)) {
+    // (suppressed inside a link's label text, and inside an <a> tag)
+    if (!NO_AUTOLINK && !INSIDE_A_TAG && (c === 119 || c === 87 || c === 104 || c === 72 || c === 102 || c === 70)) {
       const head = src.slice(i, i + 8).toLowerCase();
       if (src.startsWith('www.', i) || head.startsWith('http://') || head.startsWith('https://') || head.startsWith('ftp://')) {
         const ext = matchExtendedUrl(src, i);
@@ -383,8 +389,8 @@ function inlineItems(src, refs) {
     }
     // scheme autolink: lowercase mailto:/xmpp: + email (+ one path seg
     // for xmpp) is a single link covering the whole span
-    // (suppressed inside a link's label text)
-    if (!NO_AUTOLINK && (c === 109 || c === 120)) {
+    // (suppressed inside a link's label text, and inside an <a> tag)
+    if (!NO_AUTOLINK && !INSIDE_A_TAG && (c === 109 || c === 120)) {
       const sch = matchSchemeEmail(src, i);
       if (sch !== null) {
         flushText(i);
@@ -395,8 +401,9 @@ function inlineItems(src, refs) {
       }
     }
     // bare email (only when preceded by start or a non-word char, and the
-    // local part starts here). Suppressed inside a link's label text.
-    if (!NO_AUTOLINK && isEmailStart(src, i)) {
+    // local part starts here). Suppressed inside a link's label text,
+    // and inside an <a> tag.
+    if (!NO_AUTOLINK && !INSIDE_A_TAG && isEmailStart(src, i)) {
       const em = matchEmail(src, i);
       if (em !== null) {
         flushText(i);
@@ -1004,6 +1011,12 @@ let IN_LIST_ITEM = false;
 // True while parsing a link's label text: autolinks inside a label are
 // plain text, not links (a link's text may not contain a link).
 let NO_AUTOLINK = false;
+
+// True while inside an unclosed <a> HTML tag: autolinks are suppressed
+// (an unclosed <a> makes everything after it "inside a link" until a
+// </a> closes it). Set/cleared by the inline parser on <a> / </a> tags;
+// reset at the start of each parse() call.
+let INSIDE_A_TAG = false;
 
 function isBlankLine(s) {
   for (let i = 0; i < s.length; i++) {
@@ -2050,7 +2063,9 @@ export function parse(markdown) {
   // collect pass: gather every link reference definition in the document
   // (including ones defined after their use) before rendering
   COLLECT_ONLY = true;
+  INSIDE_A_TAG = false;
   parseBlocks(lines, 0, lines.length, refs, endLosesNL);
   COLLECT_ONLY = false;
+  INSIDE_A_TAG = false;
   return parseBlocks(lines, 0, lines.length, refs, endLosesNL);
 }
