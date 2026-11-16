@@ -188,7 +188,22 @@ function cleanInlineText(s) {
 
 const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 
+// True when the inline items so far contain an unmatched '_' emphasis
+// opener. A trailing '_' after a bare email is an emphasis closer (and
+// the email still linkifies) exactly in that case; without an opener the
+// '_' blocks the autolink.
+function openUnderscoreDelim(items) {
+  for (let k = 0; k < items.length; k++) {
+    const it = items[k];
+    if (it.t === 'delim' && it.ch === '_' && it.open) return true;
+  }
+  return false;
+}
+
 function inlineItems(src, refs) {
+  // Per-block state: a failed link's emphasis suppression never leaks
+  // from one block (or one recursive label parse) into another.
+  NO_EMPHASIS_UNTIL = -1;
   const items = [];
   let textStart = 0;
   const n = src.length;
@@ -261,8 +276,9 @@ function inlineItems(src, refs) {
       continue;
     }
     // emphasis delimiters * and _ (string boundaries count as whitespace,
-    // i.e. a newline, for flanking purposes, as in cmark)
-    if (c === 42 || c === 95) {
+    // i.e. a newline, for flanking purposes, as in cmark). Inside a
+    // failed link's label (i < NO_EMPHASIS_UNTIL) they are plain text.
+    if ((c === 42 || c === 95) && i >= NO_EMPHASIS_UNTIL) {
       const ch = src[i];
       let j = i;
       while (j < n && src[j] === ch) j++;
@@ -280,7 +296,7 @@ function inlineItems(src, refs) {
         canClose = rightFlank && (!leftFlank || isPunct(after));
       }
       flushText(i);
-      items.push({ t: 'delim', ch, n: run, open: canOpen, close: canClose });
+      items.push({ t: 'delim', ch, n: run, open: canOpen, close: canClose, aw: after !== '\n' && isWordChar(after.charCodeAt(0)) });
       i = j;
       textStart = i;
       continue;
@@ -288,7 +304,8 @@ function inlineItems(src, refs) {
     // strikethrough ~ : a run of 1 or 2 tildes is a delimiter (a run of 3+
     // is literal text); it opens when not followed by whitespace and closes
     // when not preceded by whitespace; open and close runs must match.
-    if (c === 126) {
+    // Inside a failed link's label it is plain text, like * and _.
+    if (c === 126 && i >= NO_EMPHASIS_UNTIL) {
       let j = i;
       while (j < n && src[j] === '~') j++;
       const run = j - i;
@@ -360,9 +377,47 @@ function inlineItems(src, refs) {
       if (link !== null) {
         flushText(start);
         items.push(link.item);
+        // Odd-backtick label: a link whose label holds a code span with
+        // mismatched opening/closing runs (odd total backticks) leaves
+        // emphasis suppressed until the last code span in the paragraph
+        // ('[a ``b`](u) _x y_ ``c``' leaves '_x y_' literal). Use the
+        // LAST backtick run at/after the link: an intervening complete
+        // span such as '`deno`' does not end it (doc-09), while
+        // emphasis after the last span still forms (doc-16's '**two
+        // small many**'). If there is no backtick after the link,
+        // nothing is suppressed.
+        if (link.labelOddTicks) {
+          const lastBt = src.lastIndexOf('`');
+          if (lastBt >= link.end) {
+            let rs = lastBt;
+            while (rs > link.end && src.charCodeAt(rs - 1) === 96) rs--;
+            if (rs > NO_EMPHASIS_UNTIL) NO_EMPHASIS_UNTIL = rs;
+          }
+        }
         i = link.end;
         textStart = i;
         continue;
+      }
+      // Failed link attempt. When the text has the shape [label](...)
+      // with a ')' after the '(' (so marked's link pattern matched and
+      // the label's emphasis delimiters were consumed while attempting
+      // the link), the label holds no link or image, and every backtick
+      // run in the label belongs to a complete code span, emphasis
+      // inside the label does not form: suppress * _ ~ delimiters up
+      // to the label's closing ']'. Code spans, autolinks, HTML and
+      // entities inside the label still parse. (When there is no '(' or
+      // no ')', the label holds a link/image, or a backtick run is left
+      // unpaired, the delimiters are untouched.)
+      const close2 = findLabelClose(src, open);
+      if (close2 > open && src[close2 + 1] === '(' && src.indexOf(')', close2 + 2) >= 0) {
+        const labelRaw = src.slice(open + 1, close2);
+        if (!hasUnpairedBacktickRun(labelRaw)) {
+          const savedUntil = NO_EMPHASIS_UNTIL;
+          NO_EMPHASIS_UNTIL = -1;
+          const kids = inlineItems(labelRaw, refs);
+          NO_EMPHASIS_UNTIL = savedUntil;
+          if (!labelHasLinkOrImg(kids) && close2 > NO_EMPHASIS_UNTIL) NO_EMPHASIS_UNTIL = close2;
+        }
       }
       i++;
       continue;
@@ -372,8 +427,22 @@ function inlineItems(src, refs) {
     // case-insensitive (Https:// is an autolink).
     // (suppressed inside a link's label text, and inside an <a> tag)
     if (!NO_AUTOLINK && !INSIDE_A_TAG && (c === 119 || c === 87 || c === 104 || c === 72 || c === 102 || c === 70)) {
-      const head = src.slice(i, i + 8).toLowerCase();
-      if (src.startsWith('www.', i) || head.startsWith('http://') || head.startsWith('https://') || head.startsWith('ftp://')) {
+      // Scheme check by direct charCodeAt (case-insensitive), avoiding
+      // a slice+toLowerCase allocation on every w/h/f character.
+      let isScheme = false;
+      if (src.startsWith('www.', i)) isScheme = true;
+      else if (c === 104 || c === 72) {
+        const t1 = src.charCodeAt(i + 1), t2 = src.charCodeAt(i + 2), p = src.charCodeAt(i + 3);
+        if ((t1 === 116 || t1 === 84) && (t2 === 116 || t2 === 84) && (p === 112 || p === 80)) {
+          const s = src.charCodeAt(i + 4);
+          if (s === 58 && src.charCodeAt(i + 5) === 47 && src.charCodeAt(i + 6) === 47) isScheme = true;
+          else if ((s === 115 || s === 83) && src.charCodeAt(i + 5) === 58 && src.charCodeAt(i + 6) === 47 && src.charCodeAt(i + 7) === 47) isScheme = true;
+        }
+      } else if (c === 102 || c === 70) {
+        const t1 = src.charCodeAt(i + 1), p = src.charCodeAt(i + 2);
+        if ((t1 === 116 || t1 === 84) && (p === 112 || p === 80) && src.charCodeAt(i + 3) === 58 && src.charCodeAt(i + 4) === 47 && src.charCodeAt(i + 5) === 47) isScheme = true;
+      }
+      if (isScheme) {
         const ext = matchExtendedUrl(src, i);
         if (ext !== null) {
           flushText(i);
@@ -391,7 +460,7 @@ function inlineItems(src, refs) {
     // for xmpp) is a single link covering the whole span
     // (suppressed inside a link's label text, and inside an <a> tag)
     if (!NO_AUTOLINK && !INSIDE_A_TAG && (c === 109 || c === 120)) {
-      const sch = matchSchemeEmail(src, i);
+      const sch = matchSchemeEmail(src, i, openUnderscoreDelim(items));
       if (sch !== null) {
         flushText(i);
         items.push(sch);
@@ -404,7 +473,7 @@ function inlineItems(src, refs) {
     // local part starts here). Suppressed inside a link's label text,
     // and inside an <a> tag.
     if (!NO_AUTOLINK && !INSIDE_A_TAG && isEmailStart(src, i)) {
-      const em = matchEmail(src, i);
+      const em = matchEmail(src, i, openUnderscoreDelim(items));
       if (em !== null) {
         flushText(i);
         items.push(em);
@@ -581,6 +650,21 @@ function matchExtendedUrl(src, i) {
     j++;
   }
   let end = j;
+  // an unmatched '(' (one never closed by a ')' before the end of the
+  // candidate) ends the URL just before it: 'x)](https://y' is the link
+  // 'x)]' followed by '(https://y', not one link. Only the LAST '('
+  // matters: 'a(b](c)' keeps its '(' before 'b' because the last '('
+  // (before 'c') is closed. A ')' with no '(' before it is fine mid-URL
+  // and is handled by the trailing strip below.
+  {
+    let lastOpen = -1;
+    for (let k = i; k < end; k++) if (src[k] === '(') lastOpen = k;
+    if (lastOpen >= 0) {
+      let closed = false;
+      for (let k = lastOpen + 1; k < end; k++) if (src[k] === ')') { closed = true; break; }
+      if (!closed) end = lastOpen;
+    }
+  }
   // strip trailing punctuation per GFM: ? ! . , : * _ ~ and unmatched )
   // and a trailing ; that would complete an entity reference
   while (end > i) {
@@ -588,14 +672,18 @@ function matchExtendedUrl(src, i) {
     if (ch === '?' || ch === '!' || ch === '.' || ch === ',' || ch === ':' || ch === '*' || ch === '_' || ch === '~') {
       end--;
     } else if (ch === ')') {
-      // the trailing ')' is kept only if the parens before it are balanced
-      // in its favour (count over the candidate excluding this ')')
-      let depth = 0;
+      // the trailing ')' is kept only when it is the first ')' after the
+      // last '(' in the candidate, i.e. it closes that paren; a ')' with
+      // no '(' before it, or one that follows an already-closed paren, is
+      // dropped. This is what lets 'x)](./y)' keep its ')' (the ')' after
+      // 'x' does not close the '(' before './y') while '((a))' drops one.
+      let lastOpen = -1;
+      let closedAfter = false;
       for (let k = i; k < end - 1; k++) {
-        if (src[k] === '(') depth++;
-        else if (src[k] === ')') depth--;
+        if (src[k] === '(') { lastOpen = k; closedAfter = false; }
+        else if (src[k] === ')' && lastOpen >= 0) closedAfter = true;
       }
-      if (depth <= 0) end--;
+      if (lastOpen < 0 || closedAfter) end--;
       else break;
     } else if (ch === ';') {
       // if the ; completes an entity-like &...; sequence, drop the WHOLE
@@ -621,15 +709,20 @@ function matchExtendedUrl(src, i) {
   return { t: 'auto', href, text: url, len: end - i };
 }
 
+// Lookup table for characters valid in an email address (local part,
+// domain, and '@'). Replaces a long boolean chain in the hot
+// isEmailStart/matchEmail paths.
+const EMAIL_CHARS = new Uint8Array(128);
+for (let c = 48; c <= 57; c++) EMAIL_CHARS[c] = 1;
+for (let c = 65; c <= 90; c++) EMAIL_CHARS[c] = 1;
+for (let c = 97; c <= 122; c++) EMAIL_CHARS[c] = 1;
+for (const ch of ".!#$%&'*+/=?^_`{|}~-@") EMAIL_CHARS[ch.charCodeAt(0)] = 1;
+
 function isEmailStart(src, i) {
   // an email starts here if the char is a valid local-part char and the
   // previous char is not a word char (to avoid matching inside a word)
   const c = src.charCodeAt(i);
-  const ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
-    c === 46 || c === 33 || c === 35 || c === 36 || c === 37 || c === 38 || c === 39 ||
-    c === 42 || c === 43 || c === 47 || c === 61 || c === 63 || c === 94 || c === 95 ||
-    c === 96 || c === 123 || c === 124 || c === 125 || c === 126 || c === 45;
-  if (!ok) return false;
+  if (c >= 128 || !EMAIL_CHARS[c] || c === 64) return false;
   if (i > 0) {
     const p = src.charCodeAt(i - 1);
     if (isWordChar(p) || p === 46) return false;
@@ -637,7 +730,7 @@ function isEmailStart(src, i) {
   return true;
 }
 
-function matchEmail(src, i) {
+function matchEmail(src, i, underscoreOpen) {
   const n = src.length;
   let j = i;
   let seenAt = false;
@@ -647,19 +740,32 @@ function matchEmail(src, i) {
     // '/' is valid in the local part but NOT in the domain: stop the scan
     // at a '/' once the '@' has been seen (mailto:a@b.c/ must link a@b.c)
     if (c === 47 && seenAt) break;
-    const ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
-      c === 46 || c === 33 || c === 35 || c === 36 || c === 37 || c === 38 || c === 39 ||
-      c === 42 || c === 43 || c === 47 || c === 61 || c === 63 || c === 94 || c === 95 ||
-      c === 96 || c === 123 || c === 124 || c === 125 || c === 126 || c === 45 || c === 64;
-    if (!ok) break;
+    if (c >= 128 || !EMAIL_CHARS[c]) break;
     j++;
   }
   let end = j;
-  // strip trailing punctuation like the URL rule
-  while (end > i) {
-    const ch = src[end - 1];
-    if (ch === '.' || ch === '!' || ch === '?' || ch === ',' || ch === ':' || ch === ';') end--;
-    else break;
+  // a trailing '-' after the domain blocks the autolink entirely: the
+  // char could continue the address, so a partial match is not a link at
+  // all (GFM: 'a@b.com-' stays plain). A trailing '_' blocks it too,
+  // UNLESS the '_' is an emphasis closer (underscoreOpen: an unmatched
+  // '_' opener precedes the email in this inline run, e.g. the email
+  // inside '__...__' or '_..._') — then the '_' closes the emphasis and
+  // the link forms. Other trailing punctuation (including a following
+  // emphasis delimiter such as '*' or '~') is stripped and the link forms.
+  if (end > i && src[end - 1] === '-') return null;
+  if (end > i && src[end - 1] === '_' && !underscoreOpen) return null;
+  // strip trailing punctuation: the domain part (after '@') must end with
+  // a letter or digit, so drop any trailing char that cannot end a domain.
+  // This also drops a following emphasis delimiter such as '*' or '_',
+  // which the scan above had included as a valid local-part char (so an
+  // email just before a closing '*' still linkifies).
+  const atPos = src.indexOf('@', i);
+  if (atPos >= i) {
+    while (end - 1 > atPos) {
+      const ch = src[end - 1];
+      if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) break;
+      end--;
+    }
   }
   if (end <= i) return null;
   const cand = src.slice(i, end);
@@ -672,13 +778,13 @@ function matchEmail(src, i) {
 // by a valid email. xmpp additionally takes ONE path segment (/seg);
 // mailto takes none. The whole scheme:email[/seg] is one link whose href
 // and text are the whole span. Only the lowercase schemes work.
-function matchSchemeEmail(src, i) {
+function matchSchemeEmail(src, i, underscoreOpen) {
   let schemeLen = 0;
   let isXmpp = false;
   if (src.startsWith('mailto:', i)) schemeLen = 7;
   else if (src.startsWith('xmpp:', i)) { schemeLen = 5; isXmpp = true; }
   else return null;
-  const em = matchEmail(src, i + schemeLen);
+  const em = matchEmail(src, i + schemeLen, underscoreOpen);
   if (em === null) return null;
   let end = i + schemeLen + em.len;
   if (isXmpp && end < src.length && src[end] === '/') {
@@ -712,16 +818,26 @@ function containsLink(items) {
   return false;
 }
 
+// Does the parsed label hold a link or an image (at any depth)? A
+// failed link whose label holds one does not suppress the label's
+// emphasis (marked leaves the delimiters alone there).
+function labelHasLinkOrImg(items) {
+  for (const it of items) {
+    if (it.t === 'link' || it.t === 'img') return true;
+    if ((it.t === 'em' || it.t === 'strong' || it.t === 'del') && labelHasLinkOrImg(it.kids)) return true;
+  }
+  return false;
+}
+
 // Try to parse a link (or image, when isImg) starting at src[open] ('[').
 // Returns {item, end} or null. refs maps normalized labels to {href, title}.
-function tryParseLink(src, open, refs, isImg) {
+// Length-aware label scan (the original): find the matching ']' for the
+// label, honouring nesting, code spans (a run closes at the next run of
+// the same length), and <...> tags/autolinks.
+function findLabelClose(src, open) {
   const n = src.length;
-  // find the matching ']' for the label, honouring nesting, code spans,
-  // and <...> tags/autolinks (a ']' inside a tag or autolink does not
-  // close the label)
   let depth = 0;
   let i = open + 1;
-  let close = -1;
   while (i < n) {
     const c = src.charCodeAt(i);
     if (c === 92 && i + 1 < n) { i += 2; continue; }
@@ -742,14 +858,153 @@ function tryParseLink(src, open, refs, isImg) {
     }
     if (c === 91) depth++;
     else if (c === 93) {
-      if (depth === 0) { close = i; break; }
+      if (depth === 0) return i;
       depth--;
     }
     i++;
   }
-  if (close < 0) return null;
+  return -1;
+}
+
+// Toggle label scan: like findLabelClose, but a backtick RUN of any
+// length flips an in-code-span flag at bracket depth 0, and while the
+// flag is set '[' and ']' at depth 0 are plain text (they do not open
+// or close anything). Inside a nested level, brackets are counted
+// normally and backticks do not flip the flag. Returns the index of
+// the label's closing ']' or -1.
+function findLabelCloseToggle(src, open) {
+  const n = src.length;
+  let depth = 0;
+  let inCode = false;
+  let i = open + 1;
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    if (c === 92 && i + 1 < n) { i += 2; continue; }
+    if (c === 96) {
+      let j = i;
+      while (j < n && src.charCodeAt(j) === 96) j++;
+      if (depth === 0) inCode = !inCode;
+      i = j;
+      continue;
+    }
+    if (c === 60) {
+      const tag = matchHtmlTag(src, i);
+      if (tag !== null) { i += tag.length; continue; }
+      const auto = matchAutolink(src, i);
+      if (auto !== null) { i += auto.len; continue; }
+    }
+    if (c === 91) {
+      if (!(depth === 0 && inCode)) depth++;
+    } else if (c === 93) {
+      if (depth === 0) {
+        if (!inCode) return i;
+      } else depth--;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// Does the label end with a code span whose content contains a
+// backtick? Code spans are paired greedily left to right: a run of
+// length n opens a span that closes at the next run of length n.
+function labelEndsWithBacktickSpan(label) {
+  const n = label.length;
+  if (n === 0 || label.charCodeAt(n - 1) !== 96) return false;
+  const runs = [];
+  let i = 0;
+  while (i < n) {
+    if (label.charCodeAt(i) === 96) {
+      let j = i;
+      while (j < n && label.charCodeAt(j) === 96) j++;
+      runs.push({ start: i, len: j - i });
+      i = j;
+    } else i++;
+  }
+  if (runs.length === 0) return false;
+  let k = 0;
+  let lastSpan = null;
+  while (k < runs.length) {
+    const r = runs[k];
+    let m = k + 1;
+    while (m < runs.length && runs[m].len !== r.len) m++;
+    if (m < runs.length) {
+      lastSpan = { open: r, close: runs[m] };
+      k = m + 1;
+    } else {
+      k++;
+    }
+  }
+  if (lastSpan === null) return false;
+  if (lastSpan.close !== runs[runs.length - 1]) return false;
+  const cs = lastSpan.open.start + lastSpan.open.len;
+  const ce = lastSpan.close.start;
+  for (let p = cs; p < ce; p++) {
+    if (label.charCodeAt(p) === 96) return true;
+  }
+  return false;
+}
+
+// Does the label hold a backtick run that is not part of a complete
+// code span? Runs pair greedily left to right: a run of length n opens
+// a span that closes at the next run of length n; runs in between are
+// content. A run with no later run of the same length is unpaired.
+function hasUnpairedBacktickRun(label) {
+  const n = label.length;
+  const runs = [];
+  let i = 0;
+  while (i < n) {
+    if (label.charCodeAt(i) === 96) {
+      let j = i;
+      while (j < n && label.charCodeAt(j) === 96) j++;
+      runs.push(j - i);
+      i = j;
+    } else i++;
+  }
+  let k = 0;
+  while (k < runs.length) {
+    const len = runs[k];
+    let m = k + 1;
+    while (m < runs.length && runs[m] !== len) m++;
+    if (m >= runs.length) return true;
+    k = m + 1;
+  }
+  return false;
+}
+
+function tryParseLink(src, open, refs, isImg) {
+  const n = src.length;
+  // Find the label's closing ']'. marked's bracket scan toggles an
+  // in-code-span flag at every backtick RUN (any length) at bracket
+  // depth 0, and a ']' seen while the flag is set does not close the
+  // label; brackets inside a nested level are counted normally and
+  // backticks there do not toggle. If that scan finds no close, fall
+  // back to the length-aware scan, but only when the label so found
+  // ends with a code span whose content contains a backtick (a label
+  // ending in such a span is accepted by marked even though its
+  // backtick runs are odd in number); otherwise the link is rejected.
+  let close = findLabelCloseToggle(src, open);
+  if (close < 0) {
+    const close2 = findLabelClose(src, open);
+    if (close2 < 0) return null;
+    if (!labelEndsWithBacktickSpan(src.slice(open + 1, close2))) return null;
+    close = close2;
+  }
   const labelRaw = src.slice(open + 1, close);
   if (labelRaw.length > 999) return null;
+  // Count backticks in the label. An odd total means the label holds a
+  // code span whose opening and closing runs differ in length ('a
+  // ``b`'), which marked treats as leaving an unpaired backtick that
+  // suppresses emphasis later in the paragraph until the next code
+  // span ('[a ``b`](u) _x y_ ``c``' leaves '_x y_' literal, while
+  // '[a `b`](u)' or '[a ``b``](u)' with matched runs does not).
+  // Escaped backticks ('\\`') are literal text, not code-span
+  // delimiters, and do not count (doc-07's '[... \\` path]' label).
+  let labelTicks = 0;
+  for (let q = 0; q < labelRaw.length; q++) {
+    if (labelRaw.charCodeAt(q) === 96 && (q === 0 || labelRaw.charCodeAt(q - 1) !== 92)) labelTicks++;
+  }
+  const labelOddTicks = (labelTicks % 2) === 1;
   let j = close + 1;
   // inline link: (dest "title")
   if (src[j] === '(') {
@@ -776,11 +1031,14 @@ function tryParseLink(src, open, refs, isImg) {
         }
         const prevNoAuto = NO_AUTOLINK;
         NO_AUTOLINK = true;
+        const savedUntil = NO_EMPHASIS_UNTIL;
+        NO_EMPHASIS_UNTIL = -1;
         const kids = inlineItems(labelRaw, refs);
+        NO_EMPHASIS_UNTIL = savedUntil;
         NO_AUTOLINK = prevNoAuto;
         // a link may not contain a link in its text
         if (containsLink(kids)) return null;
-        return { item: { t: 'link', href: parsed.dest, title, kids }, end: k + 1 };
+        return { item: { t: 'link', href: parsed.dest, title, kids }, end: k + 1, labelOddTicks };
       }
     }
     // not a valid inline link: fall through and try it as a reference
@@ -807,11 +1065,14 @@ function tryParseLink(src, open, refs, isImg) {
   }
   const prevNoAuto = NO_AUTOLINK;
   NO_AUTOLINK = true;
+  const savedUntil = NO_EMPHASIS_UNTIL;
+  NO_EMPHASIS_UNTIL = -1;
   const kids = inlineItems(labelRaw, refs);
+  NO_EMPHASIS_UNTIL = savedUntil;
   NO_AUTOLINK = prevNoAuto;
   // a link may not contain a link in its text
   if (containsLink(kids)) return null;
-  return { item: { t: 'link', href: ref.href, title: ref.title, kids }, end };
+  return { item: { t: 'link', href: ref.href, title: ref.title, kids }, end, labelOddTicks };
 }
 
 // Plain-text rendering of a link label (for image alt text): inline-parse
@@ -834,7 +1095,11 @@ function plainTextFromItems(items) {
 }
 
 function plainText(s, refs) {
-  return plainTextFromItems(inlineItems(s, refs));
+  const savedUntil = NO_EMPHASIS_UNTIL;
+  NO_EMPHASIS_UNTIL = -1;
+  const out = plainTextFromItems(inlineItems(s, refs));
+  NO_EMPHASIS_UNTIL = savedUntil;
+  return out;
 }
 
 // Parse a link destination starting at src[i] (after '('). Returns
@@ -923,6 +1188,41 @@ function resolveEmphasis(items) {
         const eitherBoth = (op.open && op.close) || (closer.open && closer.close);
         if (eitherBoth && (op.n + closer.n) % 3 === 0 && !(op.n % 3 === 0 && closer.n % 3 === 0)) continue;
       }
+      // blocking strong: when this pair would be an em (not a strong)
+      // with '*' delimiters, a blocking strong node (opener could not
+      // close, closer could open) that is the nearest em/strong node
+      // before the closer, with no delimiter between it and the closer,
+      // forbids pairing across it. '_' outer delimiters are not blocked
+      // (doc-05/20/31 form their outer em across such a strong). A later
+      // closer (past another em/strong node) may still pair.
+      if (op.ch === '*' && closer.ch === '*' && !(op.n >= 2 && closer.n >= 2)) {
+        let blocked = false;
+        for (let s = ci - 1; s > oj; s--) {
+          const it = items[s];
+          if (!it) continue;
+          if (it.t === 'delim') break;
+          if (it.t === 'strong' || it.t === 'em' || it.t === 'del') {
+            blocked = it.t === 'strong' && !!it.blk;
+            break;
+          }
+        }
+        if (blocked) continue;
+      }
+      // prefer strong: a single-asterisk closer must not steal one
+      // asterisk from a '**' opener (exactly two) when a later '**'
+      // closer could pair with that opener to form a strong ('**public
+      // as *so*other* option html**' keeps the strong and leaves
+      // 'other*' literal, instead of forming nested ems). An opener of
+      // three or more has asterisks enough for both an em and a strong
+      // ('***foo* bar**'), so it is not skipped. Skip such an opener.
+      if (op.n === 2 && closer.n === 1 && (op.ch === '*' || op.ch === '_')) {
+        let laterStrong = false;
+        for (let m = d + 1; m < delims.length; m++) {
+          const later = items[delims[m]];
+          if (later && later.t === 'delim' && later.ch === closer.ch && later.n >= 2 && later.close) { laterStrong = true; break; }
+        }
+        if (laterStrong) continue;
+      }
       oi = oj;
       break;
     }
@@ -934,9 +1234,18 @@ function resolveEmphasis(items) {
     // build the emphasized node from items between opener and closer
     const inner = items.slice(oi + 1, ci);
     resolveEmphasis(inner);
+    // A strong whose opener could not close and whose closer could open
+    // and is followed by a word character "blocks" an outer
+    // single-asterisk emphasis from pairing across it: '*a **b**c*'
+    // stays literal, while '*a **b** c*' (closer cannot open) and
+    // '*a**b**c*' (opener can close) form the outer em. A closer followed
+    // by punctuation (e.g. the outer '*') does not block. The block only
+    // applies to the first closer after the strong, which the opener
+    // search below enforces by looking at the nearest node.
+    const blk = !opener.close && closer.open && !!closer.aw;
     const node = opener.ch === '~'
       ? { t: 'del', kids: inner }
-      : use === 2 ? { t: 'strong', kids: inner } : { t: 'em', kids: inner };
+      : use === 2 ? { t: 'strong', kids: inner, blk } : { t: 'em', kids: inner, blk };
     // consume delimiters
     opener.n -= use;
     closer.n -= use;
@@ -956,6 +1265,27 @@ function resolveEmphasis(items) {
   for (let idx = 0; idx < items.length; idx++) {
     const it = items[idx];
     if (it.t === 'delim') items[idx] = { t: 'text', s: it.ch.repeat(it.n) };
+  }
+  // A leftover single '*' from a strong closer renders INSIDE the
+  // strong when the strong's kids end with an <em> immediately
+  // followed by word text ('**a *b*c***' -> '<strong>a
+  // <em>b</em>c*</strong>', while '**a *b* c***' with a space after
+  // the em leaves the '*' outside). This applies to strong nodes
+  // only: an <em> node's leftover '*' stays outside ('<em>changes
+  // <em>else</em>returns</em>*', doc-04/20/27). Move such a '*'
+  // text item into the strong's kids.
+  for (let idx = 0; idx + 1 < items.length; idx++) {
+    const node = items[idx];
+    const next = items[idx + 1];
+    if (node.t !== 'strong' || !next || next.t !== 'text' || next.s !== '*') continue;
+    const kids = node.kids;
+    if (kids.length < 2) continue;
+    const last = kids[kids.length - 1];
+    const prev = kids[kids.length - 2];
+    if (prev.t !== 'em' || last.t !== 'text' || last.s.length === 0) continue;
+    if (!isWordChar(last.s.charCodeAt(0))) continue;
+    last.s += '*';
+    items.splice(idx + 1, 1);
   }
 }
 
@@ -1017,6 +1347,14 @@ let NO_AUTOLINK = false;
 // </a> closes it). Set/cleared by the inline parser on <a> / </a> tags;
 // reset at the start of each parse() call.
 let INSIDE_A_TAG = false;
+
+// Source position (in the current block) before which * _ ~ runs are
+// plain text, not emphasis delimiters. Set when a link attempt fails
+// after marked has already consumed the label's emphasis delimiters
+// (see the '[' handling in inlineItems); -1 means no suppression.
+// Saved/restored around recursive inline parses, whose positions are
+// in a different string.
+let NO_EMPHASIS_UNTIL = -1;
 
 function isBlankLine(s) {
   for (let i = 0; i < s.length; i++) {
@@ -1284,6 +1622,19 @@ function splitTableRow(line) {
   if (s.startsWith('|')) s = s.slice(1);
   if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
   const cells = [];
+  // Fast path (the common case: no escaped pipes): split on '|' by index
+  // and slice each cell, instead of accumulating char by char.
+  if (!s.includes('\\|')) {
+    let start = 0;
+    for (let i = 0; i < s.length; i++) {
+      if (s.charCodeAt(i) === 124) {
+        cells.push(s.slice(start, i).trim());
+        start = i + 1;
+      }
+    }
+    cells.push(s.slice(start).trim());
+    return cells;
+  }
   let cur = '';
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
@@ -1927,7 +2278,11 @@ function parseBlocks(lines, start, end, refs, endLosesNL, ranges, lazy) {
             if (/^[ \t]*$/.test(rest)) { closed = true; j++; break; }
           }
         }
-        const stripped = stripFenceContent(l, fence.indent);
+        // marked dedents fenced code content by the fence's indent for
+        // BACKTICK fences only; a tilde fence's content keeps its
+        // indentation verbatim (probed: `  ~~~js` keeps `  foo`, while
+        // `  ```js` strips it to `foo`). Do not "fix" this to strip both.
+        const stripped = stripFenceContent(l, fence.ch === '`' ? fence.indent : 0);
         lastBlank = stripped === '';
         content += stripped + '\n';
         j++;
@@ -2002,11 +2357,16 @@ function parseBlocks(lines, start, end, refs, endLosesNL, ranges, lazy) {
         j = k;
       }
       // the block's last line keeps its newline unless the next line is
-      // blank, or this range ends where a newline is lost (the input's last
-      // line without a trailing newline, propagated into containers)
+      // blank, or this range ends where a newline is lost (the input's
+      // last line without a trailing newline, propagated into
+      // containers). For types 1-5 (pre/script/comment/etc., which end at
+      // a terminator) a line holding only spaces/tabs is NOT blank here:
+      // marked still emits the newline after the block for it. For types
+      // 6-7 (block-level tags, which end at a blank line) any blank line
+      // ends the block without a trailing newline.
       let content = blockLines.join('\n');
       let addNL = true;
-      if (j < end && isBlankLine(lines[j])) addNL = false;
+      if (j < end && (ht >= 6 ? isBlankLine(lines[j]) : lines[j] === '')) addNL = false;
       else if (j >= end && endLosesNL) addNL = false;
       if (addNL) content += '\n';
       out += content;
